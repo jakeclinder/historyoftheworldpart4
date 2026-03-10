@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useMemo } from 'react'
 import * as d3 from 'd3'
 import type { HistoricalEvent } from '../types'
 import { fetchTimelineEvents } from '../services/wikidata'
-import EventPanel from './EventPanel'
+import EventPanel, { type RankingEntry } from './EventPanel'
 
 interface Track {
   name: string
@@ -22,12 +22,18 @@ const DEFAULT_TRACKS = [
 
 const TRACK_HEIGHT = 120
 const TRACK_PADDING = 8
-const LABEL_WIDTH = 90
+const LABEL_WIDTH = 100
 
 function formatYear(year: number): string {
   if (year < 0) return `${Math.abs(year)} BCE`
   if (year === 0) return '1 CE'
   return String(year)
+}
+
+function eventScore(e: HistoricalEvent): number {
+  if (e.importance === 'critical') return 10
+  if (e.importance === 'major') return 5
+  return 1
 }
 
 export default function TimelineView() {
@@ -65,6 +71,20 @@ export default function TimelineView() {
   useEffect(() => {
     setAllEvents(tracks.flatMap((t) => t.events))
   }, [tracks])
+
+  // Compute influence rankings from events visible in current viewRange
+  const rankings = useMemo<RankingEntry[]>(() => {
+    return tracks
+      .map((track) => {
+        const visible = track.events.filter(
+          (e) => e.year >= viewRange[0] && e.year <= viewRange[1]
+        )
+        const score = visible.reduce((sum, e) => sum + eventScore(e), 0)
+        return { name: track.name, color: track.color, score, eventCount: visible.length, rank: 0 }
+      })
+      .sort((a, b) => b.score - a.score)
+      .map((entry, i) => ({ ...entry, rank: i + 1 }))
+  }, [tracks, viewRange])
 
   // D3 render
   useEffect(() => {
@@ -121,9 +141,13 @@ export default function TimelineView() {
       .attr('stroke', '#1e293b')
       .attr('stroke-width', 1)
 
+    // Build rank lookup
+    const rankMap = new Map(rankings.map((r) => [r.name, r.rank]))
+
     // Tracks
     tracks.forEach((track, idx) => {
       const trackY = idx * TRACK_HEIGHT
+      const rank = rankMap.get(track.name)
 
       // Track background
       svg
@@ -135,17 +159,30 @@ export default function TimelineView() {
         .attr('fill', idx % 2 === 0 ? '#0f0f18' : '#12121e')
         .attr('rx', 4)
 
-      // Track label
+      // Track label with rank
       svg
         .append('text')
         .attr('x', LABEL_WIDTH - 8)
-        .attr('y', trackY + TRACK_HEIGHT / 2)
+        .attr('y', trackY + TRACK_HEIGHT / 2 - 6)
         .attr('text-anchor', 'end')
         .attr('dominant-baseline', 'middle')
         .attr('fill', track.color)
         .attr('font-size', '12px')
         .attr('font-weight', '600')
         .text(track.name)
+
+      if (rank !== undefined) {
+        const medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `#${rank}`
+        svg
+          .append('text')
+          .attr('x', LABEL_WIDTH - 8)
+          .attr('y', trackY + TRACK_HEIGHT / 2 + 10)
+          .attr('text-anchor', 'end')
+          .attr('dominant-baseline', 'middle')
+          .attr('fill', '#475569')
+          .attr('font-size', '10px')
+          .text(typeof medal === 'string' && medal.startsWith('#') ? medal : medal)
+      }
 
       if (track.loading) {
         svg
@@ -159,56 +196,80 @@ export default function TimelineView() {
         return
       }
 
-      // Events as rectangles (if they have duration) or circles (point events)
+      // Events
       track.events.forEach((event) => {
         const x = xScale(event.year)
         const hasEnd = event.endYear !== undefined
         const w = hasEnd ? Math.max(4, xScale(event.endYear!) - x) : 0
+        const isCritical = event.importance === 'critical'
+        const isMajor = event.importance === 'major'
 
         if (hasEnd && w > 10) {
-          // Duration bar
+          // Duration bar — brighter for critical
           const bar = svg
             .append('rect')
             .attr('x', x)
             .attr('y', trackY + TRACK_PADDING + 10)
             .attr('width', w)
             .attr('height', TRACK_HEIGHT - TRACK_PADDING * 2 - 20)
-            .attr('fill', track.color)
-            .attr('fill-opacity', 0.25)
-            .attr('stroke', track.color)
-            .attr('stroke-opacity', 0.6)
-            .attr('stroke-width', 1)
+            .attr('fill', isCritical ? '#f59e0b' : track.color)
+            .attr('fill-opacity', isCritical ? 0.4 : 0.25)
+            .attr('stroke', isCritical ? '#f59e0b' : track.color)
+            .attr('stroke-opacity', isCritical ? 1 : 0.6)
+            .attr('stroke-width', isCritical ? 2 : 1)
             .attr('rx', 2)
             .style('cursor', 'pointer')
 
           bar.on('click', () => setSelectedEvent(event))
         } else {
-          // Point dot
+          // Point dot — sized by importance
+          const r = isCritical ? 8 : isMajor ? 6 : 4
+          const cy = isCritical
+            ? trackY + TRACK_HEIGHT / 2
+            : isMajor
+            ? trackY + TRACK_HEIGHT / 2
+            : trackY + TRACK_HEIGHT / 2
+
+          if (isCritical) {
+            // Glow ring for critical events
+            svg
+              .append('circle')
+              .attr('cx', x)
+              .attr('cy', cy)
+              .attr('r', r + 4)
+              .attr('fill', '#f59e0b')
+              .attr('fill-opacity', 0.15)
+              .style('pointer-events', 'none')
+          }
+
           const dot = svg
             .append('circle')
             .attr('cx', x)
-            .attr('cy', trackY + TRACK_HEIGHT / 2)
-            .attr('r', 5)
-            .attr('fill', track.color)
-            .attr('fill-opacity', 0.8)
+            .attr('cy', cy)
+            .attr('r', r)
+            .attr('fill', isCritical ? '#f59e0b' : track.color)
+            .attr('fill-opacity', isCritical ? 1 : isMajor ? 0.9 : 0.8)
+            .attr('stroke', isCritical ? '#fbbf24' : 'none')
+            .attr('stroke-width', 1)
             .style('cursor', 'pointer')
 
           dot.on('click', () => setSelectedEvent(event))
         }
 
-        // Label for wider items
-        const labelX = hasEnd ? x + w / 2 : x + 8
+        // Label for wider items or critical events
+        const labelX = hasEnd ? x + w / 2 : x + (isCritical ? 12 : 8)
         const labelWidth = hasEnd ? w - 4 : 80
 
-        if (labelWidth > 20) {
+        if (labelWidth > 20 || isCritical) {
           svg
             .append('text')
             .attr('x', labelX)
-            .attr('y', trackY + TRACK_HEIGHT / 2)
+            .attr('y', trackY + TRACK_HEIGHT / 2 + (isCritical ? -14 : 0))
             .attr('dominant-baseline', 'middle')
             .attr('text-anchor', hasEnd ? 'middle' : 'start')
-            .attr('fill', '#cbd5e1')
-            .attr('font-size', '10px')
+            .attr('fill', isCritical ? '#fcd34d' : '#cbd5e1')
+            .attr('font-size', isCritical ? '11px' : '10px')
+            .attr('font-weight', isCritical ? '600' : 'normal')
             .text(event.title.length > 20 ? event.title.slice(0, 18) + '…' : event.title)
             .style('pointer-events', 'none')
         }
@@ -226,7 +287,7 @@ export default function TimelineView() {
       })
 
     svg.call(zoom)
-  }, [tracks, viewRange])
+  }, [tracks, viewRange, rankings])
 
   function addTrack(e: React.FormEvent) {
     e.preventDefault()
@@ -291,13 +352,14 @@ export default function TimelineView() {
         <svg ref={svgRef} className="block" />
       </div>
 
-      {/* Event panel */}
+      {/* Event panel with rankings */}
       <EventPanel
         events={allEvents}
         selectedEvent={selectedEvent}
         onSelectEvent={setSelectedEvent}
         loading={false}
         year={viewRange[0]}
+        rankings={rankings}
       />
     </div>
   )

@@ -9,6 +9,7 @@ export interface HistoricalEvent {
   country?: string
   region?: string
   category: EventCategory
+  importance?: 'critical' | 'major' | 'minor'
   wikipediaUrl?: string
   wikidataId?: string
 }

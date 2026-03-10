@@ -10,16 +10,95 @@ function yearToWikidate(year: number): string {
   return `${String(year).padStart(4, '0')}-01-01T00:00:00Z`
 }
 
-// Map Wikidata instance types to our categories
 function inferCategory(typeLabel: string): EventCategory {
   const t = typeLabel.toLowerCase()
-  if (t.includes('war') || t.includes('battle') || t.includes('siege') || t.includes('revolt')) return 'military'
+  if (t.includes('war') || t.includes('battle') || t.includes('siege') || t.includes('revolt') || t.includes('conquest') || t.includes('invasion') || t.includes('armed conflict')) return 'military'
   if (t.includes('dynasty') || t.includes('reign') || t.includes('coronation')) return 'dynastic'
-  if (t.includes('revolution') || t.includes('election') || t.includes('treaty') || t.includes('state')) return 'political'
+  if (t.includes('revolution') || t.includes('election') || t.includes('treaty') || t.includes('state') || t.includes('independence')) return 'political'
   if (t.includes('religion') || t.includes('church') || t.includes('temple')) return 'religious'
   if (t.includes('discovery') || t.includes('invention') || t.includes('science')) return 'scientific'
   if (t.includes('trade') || t.includes('economic') || t.includes('market')) return 'economic'
   return 'cultural'
+}
+
+function scoreImportance(typeLabel: string, title: string, description: string): 'critical' | 'major' | 'minor' {
+  const text = `${typeLabel} ${title} ${description}`.toLowerCase()
+  const tl = typeLabel.toLowerCase()
+
+  const criticalKeywords = [
+    'world war', 'civil war', 'revolution', 'empire', 'independence',
+    'plague', 'pandemic', 'crusade', 'conquest', 'colonization', 'genocide',
+    'nuclear', 'great war', 'hundred years', 'thirty years', 'hundred years',
+  ]
+  if (criticalKeywords.some((k) => text.includes(k))) return 'critical'
+  if (['war', 'revolution', 'empire', 'pandemic'].some((t) => tl.includes(t))) return 'critical'
+
+  const majorKeywords = [
+    'battle', 'siege', 'rebellion', 'invasion', 'treaty', 'dynasty',
+    'uprising', 'election', 'reformation', 'expedition', 'assassination',
+  ]
+  if (majorKeywords.some((k) => text.includes(k))) return 'major'
+  if (['battle', 'treaty', 'dynasty', 'rebellion', 'armed conflict'].some((t) => tl.includes(t))) return 'major'
+
+  return 'minor'
+}
+
+// Wikidata Q-IDs for major geopolitical event types
+const MAJOR_INSTANCE_TYPES = [
+  'wd:Q198',      // war
+  'wd:Q178561',   // battle
+  'wd:Q8065',     // revolution
+  'wd:Q188451',   // military operation
+  'wd:Q167466',   // treaty
+  'wd:Q3839081',  // conquest
+  'wd:Q625994',   // armed conflict
+  'wd:Q28966989', // political assassination
+].join(' ')
+
+export async function fetchMajorEventsByYear(year: number): Promise<HistoricalEvent[]> {
+  const startDate = yearToWikidate(year - 20)
+  const endDate = yearToWikidate(year + 20)
+
+  const query = `
+SELECT DISTINCT ?item ?itemLabel ?itemDescription ?coords ?startTime ?typeLabel WHERE {
+  VALUES ?instanceType { ${MAJOR_INSTANCE_TYPES} }
+  ?item wdt:P31 ?instanceType .
+  ?item wdt:P585|wdt:P571|wdt:P580 ?startTime .
+  FILTER(?startTime >= "${startDate}"^^xsd:dateTime && ?startTime <= "${endDate}"^^xsd:dateTime)
+  OPTIONAL { ?item wdt:P625 ?coords }
+  ?instanceType rdfs:label ?typeLabel . FILTER(LANG(?typeLabel) = "en")
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" }
+}
+LIMIT 100`
+
+  const url = `${WIKIDATA_SPARQL}?query=${encodeURIComponent(query)}&format=json`
+  const res = await fetch(url, { headers: { Accept: 'application/sparql-results+json' } })
+  if (!res.ok) throw new Error(`Wikidata query failed: ${res.status}`)
+
+  const data = await res.json()
+  const bindings: WikidataBinding[] = data.results.bindings
+
+  return bindings.map((b) => {
+    const id = b.item.value.split('/').pop() ?? ''
+    const typeLabel = b.typeLabel?.value ?? ''
+    const coords = parseCoords(b.coords?.value)
+    const eventYear = b.startTime?.value ? parseYear(b.startTime.value) : year
+    const title = b.itemLabel?.value ?? id
+    const description = b.itemDescription?.value ?? ''
+
+    return {
+      id,
+      title,
+      description,
+      year: eventYear,
+      lat: coords?.lat,
+      lng: coords?.lng,
+      category: inferCategory(typeLabel),
+      importance: scoreImportance(typeLabel, title, description),
+      wikipediaUrl: `https://en.wikipedia.org/wiki/Special:GoToLinkedPage/wikidata/${id}`,
+      wikidataId: id,
+    }
+  })
 }
 
 export async function fetchEventsByYearAndRegion(
@@ -28,13 +107,8 @@ export async function fetchEventsByYearAndRegion(
   lng: number,
   radiusKm = 1500
 ): Promise<HistoricalEvent[]> {
-  // We query for historical events near a point, filtering by year range ±30 years
-  // Using a broad approach: find items with a point in time near the year, with coordinates nearby
-  const startYear = year - 25
-  const endYear = year + 25
-
-  const startDate = yearToWikidate(startYear)
-  const endDate = yearToWikidate(endYear)
+  const startDate = yearToWikidate(year - 25)
+  const endDate = yearToWikidate(year + 25)
 
   const query = `
 SELECT DISTINCT ?item ?itemLabel ?itemDescription ?coords ?startTime ?typeLabel WHERE {
@@ -49,15 +123,10 @@ SELECT DISTINCT ?item ?itemLabel ?itemDescription ?coords ?startTime ?typeLabel 
   }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
 }
-LIMIT 40
-`
+LIMIT 40`
 
   const url = `${WIKIDATA_SPARQL}?query=${encodeURIComponent(query)}&format=json`
-
-  const res = await fetch(url, {
-    headers: { Accept: 'application/sparql-results+json' },
-  })
-
+  const res = await fetch(url, { headers: { Accept: 'application/sparql-results+json' } })
   if (!res.ok) throw new Error(`Wikidata query failed: ${res.status}`)
 
   const data = await res.json()
@@ -67,17 +136,19 @@ LIMIT 40
     const id = b.item.value.split('/').pop() ?? ''
     const typeLabel = b.typeLabel?.value ?? ''
     const coords = parseCoords(b.coords?.value)
-    const startTime = b.startTime?.value
-    const eventYear = startTime ? parseYear(startTime) : year
+    const eventYear = b.startTime?.value ? parseYear(b.startTime.value) : year
+    const title = b.itemLabel?.value ?? id
+    const description = b.itemDescription?.value ?? ''
 
     return {
       id,
-      title: b.itemLabel?.value ?? id,
-      description: b.itemDescription?.value ?? '',
+      title,
+      description,
       year: eventYear,
       lat: coords?.lat,
       lng: coords?.lng,
       category: inferCategory(typeLabel),
+      importance: scoreImportance(typeLabel, title, description),
       wikipediaUrl: `https://en.wikipedia.org/wiki/Special:GoToLinkedPage/wikidata/${id}`,
       wikidataId: id,
     }
@@ -85,26 +156,21 @@ LIMIT 40
 }
 
 export async function fetchEventsByYearGlobal(year: number): Promise<HistoricalEvent[]> {
-  const startYear = year - 10
-  const endYear = year + 10
-  const startDate = yearToWikidate(startYear)
-  const endDate = yearToWikidate(endYear)
+  const startDate = yearToWikidate(year - 10)
+  const endDate = yearToWikidate(year + 10)
 
   const query = `
-SELECT DISTINCT ?item ?itemLabel ?itemDescription ?coords ?startTime WHERE {
+SELECT DISTINCT ?item ?itemLabel ?itemDescription ?coords ?startTime ?typeLabel WHERE {
   ?item wdt:P625 ?coords .
   ?item wdt:P585|wdt:P571 ?startTime .
   FILTER(?startTime >= "${startDate}"^^xsd:dateTime && ?startTime <= "${endDate}"^^xsd:dateTime)
+  OPTIONAL { ?item wdt:P31 ?type . ?type rdfs:label ?typeLabel . FILTER(LANG(?typeLabel) = "en") }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
 }
-LIMIT 60
-`
+LIMIT 60`
 
   const url = `${WIKIDATA_SPARQL}?query=${encodeURIComponent(query)}&format=json`
-  const res = await fetch(url, {
-    headers: { Accept: 'application/sparql-results+json' },
-  })
-
+  const res = await fetch(url, { headers: { Accept: 'application/sparql-results+json' } })
   if (!res.ok) throw new Error(`Wikidata query failed: ${res.status}`)
 
   const data = await res.json()
@@ -114,17 +180,21 @@ LIMIT 60
     .filter((b) => b.coords)
     .map((b) => {
       const id = b.item.value.split('/').pop() ?? ''
+      const typeLabel = b.typeLabel?.value ?? ''
       const coords = parseCoords(b.coords?.value)
       const eventYear = b.startTime?.value ? parseYear(b.startTime.value) : year
+      const title = b.itemLabel?.value ?? id
+      const description = b.itemDescription?.value ?? ''
 
       return {
         id,
-        title: b.itemLabel?.value ?? id,
-        description: b.itemDescription?.value ?? '',
+        title,
+        description,
         year: eventYear,
         lat: coords?.lat,
         lng: coords?.lng,
-        category: 'political' as EventCategory,
+        category: inferCategory(typeLabel),
+        importance: scoreImportance(typeLabel, title, description),
         wikipediaUrl: `https://en.wikipedia.org/wiki/Special:GoToLinkedPage/wikidata/${id}`,
         wikidataId: id,
       }
@@ -140,23 +210,20 @@ export async function fetchTimelineEvents(
   const endDate = yearToWikidate(endYear)
 
   const query = `
-SELECT DISTINCT ?item ?itemLabel ?itemDescription ?startTime ?endTime WHERE {
+SELECT DISTINCT ?item ?itemLabel ?itemDescription ?startTime ?endTime ?typeLabel WHERE {
   ?item wdt:P585|wdt:P571|wdt:P580 ?startTime .
   FILTER(?startTime >= "${startDate}"^^xsd:dateTime && ?startTime <= "${endDate}"^^xsd:dateTime)
   ?item rdfs:label ?label .
   FILTER(LANG(?label) = "en")
   FILTER(CONTAINS(LCASE(?label), "${civilizationOrRegion.toLowerCase()}"))
   OPTIONAL { ?item wdt:P582 ?endTime . }
+  OPTIONAL { ?item wdt:P31 ?type . ?type rdfs:label ?typeLabel . FILTER(LANG(?typeLabel) = "en") }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
 }
-LIMIT 50
-`
+LIMIT 50`
 
   const url = `${WIKIDATA_SPARQL}?query=${encodeURIComponent(query)}&format=json`
-  const res = await fetch(url, {
-    headers: { Accept: 'application/sparql-results+json' },
-  })
-
+  const res = await fetch(url, { headers: { Accept: 'application/sparql-results+json' } })
   if (!res.ok) throw new Error(`Wikidata query failed: ${res.status}`)
 
   const data = await res.json()
@@ -164,16 +231,20 @@ LIMIT 50
 
   return bindings.map((b) => {
     const id = b.item.value.split('/').pop() ?? ''
+    const typeLabel = b.typeLabel?.value ?? ''
     const eventYear = b.startTime?.value ? parseYear(b.startTime.value) : startYear
     const endEventYear = b.endTime?.value ? parseYear(b.endTime.value) : undefined
+    const title = b.itemLabel?.value ?? id
+    const description = b.itemDescription?.value ?? ''
 
     return {
       id,
-      title: b.itemLabel?.value ?? id,
-      description: b.itemDescription?.value ?? '',
+      title,
+      description,
       year: eventYear,
       endYear: endEventYear,
-      category: 'political' as EventCategory,
+      category: inferCategory(typeLabel),
+      importance: scoreImportance(typeLabel, title, description),
       region: civilizationOrRegion,
       wikidataId: id,
       wikipediaUrl: `https://en.wikipedia.org/wiki/Special:GoToLinkedPage/wikidata/${id}`,
@@ -182,7 +253,6 @@ LIMIT 50
 }
 
 export async function fetchWikipediaSummary(wikidataId: string): Promise<string> {
-  // Resolve Wikidata ID to Wikipedia URL via Wikidata API
   const res = await fetch(
     `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${wikidataId}&props=sitelinks&sitelinkfilter=enwiki&format=json&origin=*`
   )
@@ -216,14 +286,12 @@ interface WikidataBinding {
 
 function parseCoords(wkt: string | undefined): { lat: number; lng: number } | null {
   if (!wkt) return null
-  // WKT format: "Point(lng lat)"
   const match = wkt.match(/Point\(([-.0-9]+)\s+([-.0-9]+)\)/)
   if (!match) return null
   return { lng: parseFloat(match[1]), lat: parseFloat(match[2]) }
 }
 
 function parseYear(dateStr: string): number {
-  // Handles "+1776-01-01T..." and "-0500-01-01T..."
   const match = dateStr.match(/^([+-]?\d+)-/)
   if (!match) return 0
   return parseInt(match[1], 10)
